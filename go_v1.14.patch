@@ -1,0 +1,237 @@
+From 77c56d0b579d1bc7026786f3bac552b66233b2d0 Mon Sep 17 00:00:00 2001
+From: Vyacheslav Pachkov <slava.pach@gmail.com>
+Date: Fri, 5 Mar 2021 15:29:01 -0500
+Subject: [PATCH] add ARM mapping symbols support
+
+And align functions by NOP instructions
+---
+ src/cmd/internal/goobj/read.go           |  1 +
+ src/cmd/internal/obj/arm64/asm7.go       |  7 ++-
+ src/cmd/internal/obj/link.go             |  2 +
+ src/cmd/internal/obj/objfile.go          |  2 +
+ src/cmd/internal/obj/sizeof_test.go      |  2 +-
+ src/cmd/link/internal/ld/symtab.go       | 72 +++++++++++++++++++++---
+ src/cmd/link/internal/objfile/objfile.go |  2 +
+ src/cmd/link/internal/sym/sizeof_test.go |  2 +-
+ src/cmd/link/internal/sym/symbol.go      |  2 +
+ 9 files changed, 82 insertions(+), 10 deletions(-)
+
+diff --git a/src/cmd/internal/goobj/read.go b/src/cmd/internal/goobj/read.go
+index e61e95dcc8..8cc113932a 100644
+--- a/src/cmd/internal/goobj/read.go
++++ b/src/cmd/internal/goobj/read.go
+@@ -586,6 +586,7 @@ func (r *objReader) parseObject(prefix []byte) error {
+ 		}
+ 
+ 		if s.Kind == objabi.STEXT {
++			r.readInt() // reading PoolAddr
+ 			f := new(Func)
+ 			s.Func = f
+ 			f.Args = r.readInt()
+diff --git a/src/cmd/internal/obj/arm64/asm7.go b/src/cmd/internal/obj/arm64/asm7.go
+index 4a7af80f39..0da0331e8a 100644
+--- a/src/cmd/internal/obj/arm64/asm7.go
++++ b/src/cmd/internal/obj/arm64/asm7.go
+@@ -999,7 +999,11 @@ func span7(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
+ 	/*
+ 	 * lay out the code, emitting code and data relocations.
+ 	 */
+-	c.cursym.Grow(c.cursym.Size)
++	needBytes := int(c.cursym.Size)-len(c.cursym.P)
++	for i := 0 ; i < needBytes / 4 ; i++ {
++		nop := []byte{0x1f,0x20,0x03,0xd5}
++		c.cursym.P = append(c.cursym.P, nop...)
++	}
+ 	bp := c.cursym.P
+ 	psz := int32(0)
+ 	var i int
+@@ -1067,6 +1071,7 @@ func (c *ctxt7) flushpool(p *obj.Prog, skip int) {
+ 			if c.ctxt.Debugvlog && skip == 1 {
+ 				fmt.Printf("note: flush literal pool at %#x: len=%d ref=%x\n", uint64(p.Pc+4), c.pool.size, c.pool.start)
+ 			}
++			c.cursym.PoolAddr = int64(p.Pc + 8)
+ 			q := c.newprog()
+ 			q.As = AB
+ 			q.To.Type = obj.TYPE_BRANCH
+diff --git a/src/cmd/internal/obj/link.go b/src/cmd/internal/obj/link.go
+index fd082d02e5..b6664758e5 100644
+--- a/src/cmd/internal/obj/link.go
++++ b/src/cmd/internal/obj/link.go
+@@ -387,6 +387,8 @@ type LSym struct {
+ 	P      []byte
+ 	R      []Reloc
+ 
++	PoolAddr int64 // literal pool location, (used when compiling for ARM)
++
+ 	Func *FuncInfo
+ 
+ 	Pkg    string
+diff --git a/src/cmd/internal/obj/objfile.go b/src/cmd/internal/obj/objfile.go
+index b94e099bae..5c9623bd3a 100644
+--- a/src/cmd/internal/obj/objfile.go
++++ b/src/cmd/internal/obj/objfile.go
+@@ -347,6 +347,8 @@ func (w *objWriter) writeSym(s *LSym) {
+ 		return
+ 	}
+ 
++	w.writeInt(int64(s.PoolAddr))
++
+ 	w.writeInt(int64(s.Func.Args))
+ 	w.writeInt(int64(s.Func.Locals))
+ 	w.writeBool(s.NoSplit())
+diff --git a/src/cmd/internal/obj/sizeof_test.go b/src/cmd/internal/obj/sizeof_test.go
+index b5e170c694..037cadb6ec 100644
+--- a/src/cmd/internal/obj/sizeof_test.go
++++ b/src/cmd/internal/obj/sizeof_test.go
+@@ -21,7 +21,7 @@ func TestSizeof(t *testing.T) {
+ 		_64bit uintptr     // size on 64bit platforms
+ 	}{
+ 		{Addr{}, 32, 48},
+-		{LSym{}, 76, 128},
++		{LSym{}, 84, 136},
+ 		{Prog{}, 132, 200},
+ 	}
+ 
+diff --git a/src/cmd/link/internal/ld/symtab.go b/src/cmd/link/internal/ld/symtab.go
+index bba623eb48..4102974ef4 100644
+--- a/src/cmd/link/internal/ld/symtab.go
++++ b/src/cmd/link/internal/ld/symtab.go
+@@ -77,6 +77,46 @@ var numelfsym = 1 // 0 is reserved
+ 
+ var elfbind int
+ 
++var (
++	doSyms = true
++	doMappingSyms = false
++	wasDataSymb = true
++	dataMappingSymbOff int
++	codeMappingSymbOff int
++)
++
++// Puts a symbol entry along with the mapping symbol entries
++
++func putelfsymentries(out *OutBuf, x *sym.Symbol, s string, t SymbolType, local bool, addr int64, size int64, info int, elfshnum int, other int) {
++	if doMappingSyms {
++		if  t == TextSym && wasDataSymb {
++			putelfsyment(out, codeMappingSymbOff, addr, 0, STB_LOCAL<<4|STT_NOTYPE, elfshnum, other)
++			numelfsym++
++		}
++	}
++
++	if doSyms {
++		if local {
++			putelfsyment(out, putelfstr("local."+s), addr, size, info, elfshnum, other)
++			x.LocalElfsym = int32(numelfsym)
++		} else {
++			putelfsyment(out, putelfstr(s), addr, size, info, elfshnum, other)
++			x.Elfsym = int32(numelfsym)
++		}
++		numelfsym++
++	}
++
++	if doMappingSyms {
++		if t == TextSym && x.PoolAddr > 0 {
++			putelfsyment(out, dataMappingSymbOff, addr + x.PoolAddr, 0, STB_LOCAL<<4|STT_NOTYPE, elfshnum, other)
++			numelfsym++
++			wasDataSymb = true // the next symbol should be marked as code
++		} else {
++			wasDataSymb = false // the next symbol shouldn't be marked as code
++		}
++	}
++}
++
+ func putelfsym(ctxt *Link, x *sym.Symbol, s string, t SymbolType, addr int64, go_ *sym.Symbol) {
+ 	var typ int
+ 
+@@ -180,17 +220,13 @@ func putelfsym(ctxt *Link, x *sym.Symbol, s string, t SymbolType, addr int64, go
+ 		// (*sym.Symbol).ElfsymForReloc). This is approximately equivalent to the
+ 		// ELF linker -Bsymbolic-functions option, but that is buggy on
+ 		// several platforms.
+-		putelfsyment(ctxt.Out, putelfstr("local."+s), addr, size, STB_LOCAL<<4|typ&0xf, elfshnum, other)
+-		x.LocalElfsym = int32(numelfsym)
+-		numelfsym++
++
++		putelfsymentries(ctxt.Out, x, s, t, true, addr, size, STB_LOCAL<<4|typ&0xf, elfshnum, other)
+ 		return
+ 	} else if bind != elfbind {
+ 		return
+ 	}
+-
+-	putelfsyment(ctxt.Out, putelfstr(s), addr, size, bind<<4|typ&0xf, elfshnum, other)
+-	x.Elfsym = int32(numelfsym)
+-	numelfsym++
++	putelfsymentries(ctxt.Out, x, s, t, false, addr, size, bind<<4|typ&0xf, elfshnum, other)
+ }
+ 
+ func putelfsectionsym(out *OutBuf, s *sym.Symbol, shndx int) {
+@@ -212,6 +248,28 @@ func Asmelfsym(ctxt *Link) {
+ 	putelfsyment(ctxt.Out, putelfstr("go.go"), 0, 0, STB_LOCAL<<4|STT_FILE, SHN_ABS, 0)
+ 	numelfsym++
+ 
++	if ctxt.Arch.Family == sys.ARM64 {
++		dataMappingSymbOff = putelfstr("$d")
++		codeMappingSymbOff = putelfstr("$x")
++
++		elfbind = STB_LOCAL
++		doSyms = true
++		doMappingSyms = true
++		genasmsym(ctxt, putelfsym)
++
++		elfbind = STB_GLOBAL
++		doSyms = false
++		doMappingSyms = true
++		genasmsym(ctxt, putelfsym)
++
++		elfbind = STB_GLOBAL
++		doSyms = true
++		doMappingSyms = false
++		elfglobalsymndx = numelfsym
++		genasmsym(ctxt, putelfsym)
++		return
++	}
++
+ 	elfbind = STB_LOCAL
+ 	genasmsym(ctxt, putelfsym)
+ 
+diff --git a/src/cmd/link/internal/objfile/objfile.go b/src/cmd/link/internal/objfile/objfile.go
+index 599a85585f..271d6f8fda 100644
+--- a/src/cmd/link/internal/objfile/objfile.go
++++ b/src/cmd/link/internal/objfile/objfile.go
+@@ -309,6 +309,8 @@ overwrite:
+ 	}
+ 
+ 	if s.Type == sym.STEXT {
++		s.PoolAddr = r.readInt64()
++
+ 		s.FuncInfo = new(sym.FuncInfo)
+ 		pc := s.FuncInfo
+ 
+diff --git a/src/cmd/link/internal/sym/sizeof_test.go b/src/cmd/link/internal/sym/sizeof_test.go
+index e6e3916dad..6db3afa27c 100644
+--- a/src/cmd/link/internal/sym/sizeof_test.go
++++ b/src/cmd/link/internal/sym/sizeof_test.go
+@@ -21,7 +21,7 @@ func TestSizeof(t *testing.T) {
+ 		_32bit uintptr     // size on 32bit platforms
+ 		_64bit uintptr     // size on 64bit platforms
+ 	}{
+-		{Symbol{}, 108, 176},
++		{Symbol{}, 116, 184},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/src/cmd/link/internal/sym/symbol.go b/src/cmd/link/internal/sym/symbol.go
+index e9819a064f..73e133297b 100644
+--- a/src/cmd/link/internal/sym/symbol.go
++++ b/src/cmd/link/internal/sym/symbol.go
+@@ -36,6 +36,8 @@ type Symbol struct {
+ 	// P contains the raw symbol data.
+ 	P []byte
+ 	R []Reloc
++
++	PoolAddr int64 // literal pool location, (used when compiling for ARM)
+ }
+ 
+ // AuxSymbol contains less-frequently used sym.Symbol fields.
+-- 
+2.33.1
+

@@ -1,0 +1,283 @@
+From 8b0733c64ac496692b6378ab20599cffe7242503 Mon Sep 17 00:00:00 2001
+From: Vyacheslav Pachkov <slava.pach@gmail.com>
+Date: Tue, 3 Aug 2021 10:38:39 -0400
+Subject: [PATCH] cmd: support mapping symbols for ARM64
+
+---
+ src/cmd/internal/goobj/objfile.go      | 29 ++++++-----
+ src/cmd/internal/obj/arm64/asm7.go     |  7 ++-
+ src/cmd/internal/obj/link.go           |  2 +
+ src/cmd/internal/obj/objfile.go        |  1 +
+ src/cmd/internal/obj/sizeof_test.go    |  2 +-
+ src/cmd/link/internal/ld/symtab.go     | 71 +++++++++++++++++++++++---
+ src/cmd/link/internal/loader/loader.go | 12 +++++
+ 7 files changed, 103 insertions(+), 21 deletions(-)
+
+diff --git a/src/cmd/internal/goobj/objfile.go b/src/cmd/internal/goobj/objfile.go
+index fec46cb97a..960fe44bae 100644
+--- a/src/cmd/internal/goobj/objfile.go
++++ b/src/cmd/internal/goobj/objfile.go
+@@ -276,10 +276,11 @@ func (p *ImportedPkg) Write(w *Writer) {
+ //    Flag2 uint8
+ //    Siz   uint32
+ //    Align uint32
++//    PoolAddr uint32
+ // }
+ type Sym [SymSize]byte
+ 
+-const SymSize = stringRefSize + 2 + 1 + 1 + 1 + 4 + 4
++const SymSize = stringRefSize + 2 + 1 + 1 + 1 + 4 + 4 + 4
+ 
+ const SymABIstatic = ^uint16(0)
+ 
+@@ -319,12 +320,13 @@ func (s *Sym) Name(r *Reader) string {
+ 	return r.StringAt(off, len)
+ }
+ 
+-func (s *Sym) ABI() uint16   { return binary.LittleEndian.Uint16(s[8:]) }
+-func (s *Sym) Type() uint8   { return s[10] }
+-func (s *Sym) Flag() uint8   { return s[11] }
+-func (s *Sym) Flag2() uint8  { return s[12] }
+-func (s *Sym) Siz() uint32   { return binary.LittleEndian.Uint32(s[13:]) }
+-func (s *Sym) Align() uint32 { return binary.LittleEndian.Uint32(s[17:]) }
++func (s *Sym) ABI() uint16      { return binary.LittleEndian.Uint16(s[8:]) }
++func (s *Sym) Type() uint8      { return s[10] }
++func (s *Sym) Flag() uint8      { return s[11] }
++func (s *Sym) Flag2() uint8     { return s[12] }
++func (s *Sym) Siz() uint32      { return binary.LittleEndian.Uint32(s[13:]) }
++func (s *Sym) Align() uint32    { return binary.LittleEndian.Uint32(s[17:]) }
++func (s *Sym) PoolAddr() uint32 { return binary.LittleEndian.Uint32(s[21:]) }
+ 
+ func (s *Sym) Dupok() bool         { return s.Flag()&SymFlagDupok != 0 }
+ func (s *Sym) Local() bool         { return s.Flag()&SymFlagLocal != 0 }
+@@ -343,12 +345,13 @@ func (s *Sym) SetName(x string, w *Writer) {
+ 	binary.LittleEndian.PutUint32(s[4:], w.stringOff(x))
+ }
+ 
+-func (s *Sym) SetABI(x uint16)   { binary.LittleEndian.PutUint16(s[8:], x) }
+-func (s *Sym) SetType(x uint8)   { s[10] = x }
+-func (s *Sym) SetFlag(x uint8)   { s[11] = x }
+-func (s *Sym) SetFlag2(x uint8)  { s[12] = x }
+-func (s *Sym) SetSiz(x uint32)   { binary.LittleEndian.PutUint32(s[13:], x) }
+-func (s *Sym) SetAlign(x uint32) { binary.LittleEndian.PutUint32(s[17:], x) }
++func (s *Sym) SetABI(x uint16)      { binary.LittleEndian.PutUint16(s[8:], x) }
++func (s *Sym) SetType(x uint8)      { s[10] = x }
++func (s *Sym) SetFlag(x uint8)      { s[11] = x }
++func (s *Sym) SetFlag2(x uint8)     { s[12] = x }
++func (s *Sym) SetSiz(x uint32)      { binary.LittleEndian.PutUint32(s[13:], x) }
++func (s *Sym) SetAlign(x uint32)    { binary.LittleEndian.PutUint32(s[17:], x) }
++func (s *Sym) SetPoolAddr(x uint32) { binary.LittleEndian.PutUint32(s[21:], x) }
+ 
+ func (s *Sym) Write(w *Writer) { w.Bytes(s[:]) }
+ 
+diff --git a/src/cmd/internal/obj/arm64/asm7.go b/src/cmd/internal/obj/arm64/asm7.go
+index 70072cfba4..c2b1e8c6bc 100644
+--- a/src/cmd/internal/obj/arm64/asm7.go
++++ b/src/cmd/internal/obj/arm64/asm7.go
+@@ -1081,7 +1081,11 @@ func span7(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
+ 	/*
+ 	 * lay out the code, emitting code and data relocations.
+ 	 */
+-	c.cursym.Grow(c.cursym.Size)
++	needBytes := int(c.cursym.Size)-len(c.cursym.P)
++	for i := 0 ; i < needBytes / 4 ; i++ {
++		nop := []byte{0x1f,0x20,0x03,0xd5}
++		c.cursym.P = append(c.cursym.P, nop...)
++	}
+ 	bp := c.cursym.P
+ 	psz := int32(0)
+ 	var i int
+@@ -1173,6 +1177,7 @@ func (c *ctxt7) flushpool(p *obj.Prog, skip int) {
+ 			if c.ctxt.Debugvlog && skip == 1 {
+ 				fmt.Printf("note: flush literal pool at %#x: len=%d ref=%x\n", uint64(p.Pc+4), c.pool.size, c.pool.start)
+ 			}
++			c.cursym.PoolAddr = int64(p.Pc + 8)
+ 			q := c.newprog()
+ 			q.As = AB
+ 			q.To.Type = obj.TYPE_BRANCH
+diff --git a/src/cmd/internal/obj/link.go b/src/cmd/internal/obj/link.go
+index 270ac77c88..8e104886a8 100644
+--- a/src/cmd/internal/obj/link.go
++++ b/src/cmd/internal/obj/link.go
+@@ -434,6 +434,8 @@ type LSym struct {
+ 	P      []byte
+ 	R      []Reloc
+ 
++	PoolAddr int64 // literal pool location, (used when compiling for ARM)
++
+ 	Extra *interface{} // *FuncInfo or *FileInfo, if present
+ 
+ 	Pkg    string
+diff --git a/src/cmd/internal/obj/objfile.go b/src/cmd/internal/obj/objfile.go
+index e91eccf8ab..1d4158091b 100644
+--- a/src/cmd/internal/obj/objfile.go
++++ b/src/cmd/internal/obj/objfile.go
+@@ -384,6 +384,7 @@ func (w *writer) Sym(s *LSym) {
+ 	o.SetFlag2(flag2)
+ 	o.SetSiz(uint32(s.Size))
+ 	o.SetAlign(align)
++	o.SetPoolAddr(uint32(s.PoolAddr))
+ 	o.Write(w.Writer)
+ }
+ 
+diff --git a/src/cmd/internal/obj/sizeof_test.go b/src/cmd/internal/obj/sizeof_test.go
+index 69e60473f5..4bea3eea1b 100644
+--- a/src/cmd/internal/obj/sizeof_test.go
++++ b/src/cmd/internal/obj/sizeof_test.go
+@@ -21,7 +21,7 @@ func TestSizeof(t *testing.T) {
+ 		_64bit uintptr     // size on 64bit platforms
+ 	}{
+ 		{Addr{}, 32, 48},
+-		{LSym{}, 72, 120},
++		{LSym{}, 80, 128},
+ 		{Prog{}, 132, 200},
+ 	}
+ 
+diff --git a/src/cmd/link/internal/ld/symtab.go b/src/cmd/link/internal/ld/symtab.go
+index f54cf9ea2f..66c1d858f5 100644
+--- a/src/cmd/link/internal/ld/symtab.go
++++ b/src/cmd/link/internal/ld/symtab.go
+@@ -33,6 +33,7 @@ package ld
+ import (
+ 	"cmd/internal/obj"
+ 	"cmd/internal/objabi"
++	"cmd/internal/sys"
+ 	"cmd/link/internal/loader"
+ 	"cmd/link/internal/sym"
+ 	"debug/elf"
+@@ -75,6 +76,48 @@ func putelfsyment(out *OutBuf, off int, addr int64, size int64, info uint8, shnd
+ 	}
+ }
+ 
++var (
++	putsyms = true
++	putmappingsyms = false
++	needcodesymb = true
++	datamappingsymboff int
++	codemappingsymboff int
++)
++
++// Puts a symbol entry along with mapping symbol entries
++
++func putelfsymentries(ctxt *Link, x loader.Sym, sname string, local bool, addr int64, size int64, info uint8, shndx elf.SectionIndex, other int) {
++	ldr := ctxt.loader
++	typ := elf.ST_TYPE(info)
++	if putmappingsyms {
++		if typ == elf.STT_FUNC && needcodesymb {
++			putelfsyment(ctxt.Out, codemappingsymboff, addr, 0, elf.ST_INFO(elf.STB_LOCAL, 0), shndx, other)
++			ctxt.numelfsym++
++		}
++	}
++	if putsyms {
++		if local {
++			putelfsyment(ctxt.Out, putelfstr("local."+sname), addr, size, info, shndx, other)
++			ldr.SetSymLocalElfSym(x, int32(ctxt.numelfsym))
++			ctxt.numelfsym++
++		} else {
++			putelfsyment(ctxt.Out, putelfstr(sname), addr, size, info, shndx, other)
++			ldr.SetSymElfSym(x, int32(ctxt.numelfsym))
++			ctxt.numelfsym++
++		}
++	}
++	if putmappingsyms {
++		poolAddr := ldr.SymPoolAddr(x)
++		if typ == elf.STT_FUNC && poolAddr > 0 {
++			putelfsyment(ctxt.Out, datamappingsymboff, addr+poolAddr, 0, elf.ST_INFO(elf.STB_LOCAL, 0), shndx, other)
++			ctxt.numelfsym++
++			needcodesymb = true
++		} else {
++			needcodesymb = typ != elf.STT_FUNC
++		}
++	}
++}
++
+ func putelfsym(ctxt *Link, x loader.Sym, typ elf.SymType, curbind elf.SymBind) {
+ 	ldr := ctxt.loader
+ 	addr := ldr.SymValue(x)
+@@ -162,17 +205,13 @@ func putelfsym(ctxt *Link, x loader.Sym, typ elf.SymType, curbind elf.SymBind) {
+ 		// (*sym.Symbol).ElfsymForReloc). This is approximately equivalent to the
+ 		// ELF linker -Bsymbolic-functions option, but that is buggy on
+ 		// several platforms.
+-		putelfsyment(ctxt.Out, putelfstr("local."+sname), addr, size, elf.ST_INFO(elf.STB_LOCAL, typ), elfshnum, other)
+-		ldr.SetSymLocalElfSym(x, int32(ctxt.numelfsym))
+-		ctxt.numelfsym++
++		putelfsymentries(ctxt, x, sname, true, addr, size, elf.ST_INFO(elf.STB_LOCAL, typ), elfshnum, other)
+ 		return
+ 	} else if bind != curbind {
+ 		return
+ 	}
+ 
+-	putelfsyment(ctxt.Out, putelfstr(sname), addr, size, elf.ST_INFO(bind, typ), elfshnum, other)
+-	ldr.SetSymElfSym(x, int32(ctxt.numelfsym))
+-	ctxt.numelfsym++
++	putelfsymentries(ctxt, x, sname, false, addr, size, elf.ST_INFO(bind, typ), elfshnum, other)
+ }
+ 
+ func putelfsectionsym(ctxt *Link, out *OutBuf, s loader.Sym, shndx elf.SectionIndex) {
+@@ -273,6 +312,26 @@ func asmElfSym(ctxt *Link) {
+ 	putelfsyment(ctxt.Out, putelfstr("go.go"), 0, 0, elf.ST_INFO(elf.STB_LOCAL, elf.STT_FILE), elf.SHN_ABS, 0)
+ 	ctxt.numelfsym++
+ 
++	if ctxt.Arch.Family == sys.ARM64 {
++		datamappingsymboff = putelfstr("$d")
++		codemappingsymboff = putelfstr("$x")
++
++		putsyms = true
++		putmappingsyms = true
++		genelfsym(ctxt, elf.STB_LOCAL)
++
++		putsyms = false
++		putmappingsyms = true
++		genelfsym(ctxt, elf.STB_GLOBAL)
++
++		elfglobalsymndx = ctxt.numelfsym
++
++		putsyms = true
++		putmappingsyms = false
++		genelfsym(ctxt, elf.STB_GLOBAL)
++		return
++	}
++
+ 	bindings := []elf.SymBind{elf.STB_LOCAL, elf.STB_GLOBAL}
+ 	for _, elfbind := range bindings {
+ 		if elfbind == elf.STB_GLOBAL {
+diff --git a/src/cmd/link/internal/loader/loader.go b/src/cmd/link/internal/loader/loader.go
+index a95e017af2..a85904ef48 100644
+--- a/src/cmd/link/internal/loader/loader.go
++++ b/src/cmd/link/internal/loader/loader.go
+@@ -311,6 +311,7 @@ type elfsetstringFunc func(str string, off int)
+ type extSymPayload struct {
+ 	name     string // TODO: would this be better as offset into str table?
+ 	size     int64
++	poolAddr int64
+ 	ver      int
+ 	kind     sym.SymKind
+ 	objidx   uint32 // index of original object if sym made by cloneToExternal
+@@ -823,6 +824,16 @@ func (l *Loader) SymSize(i Sym) int64 {
+ 	return int64(r.Sym(li).Siz())
+ }
+ 
++// Returns the size of the i-th symbol.
++func (l *Loader) SymPoolAddr(i Sym) int64 {
++	if l.IsExternal(i) {
++		pp := l.getPayload(i)
++		return pp.poolAddr
++	}
++	r, li := l.toLocal(i)
++	return int64(r.Sym(li).PoolAddr())
++}
++
+ // AttrReachable returns true for symbols that are transitively
+ // referenced from the entry points. Unreachable symbols are not
+ // written to the output.
+@@ -2359,6 +2370,7 @@ func (l *Loader) cloneToExternal(symIdx Sym) {
+ 	pp.kind = skind
+ 	pp.ver = sver
+ 	pp.size = int64(osym.Siz())
++	pp.poolAddr = int64(osym.PoolAddr())
+ 	pp.objidx = r.objidx
+ 
+ 	// If this is a def, then copy the guts. We expect this case
+-- 
+2.33.1
+

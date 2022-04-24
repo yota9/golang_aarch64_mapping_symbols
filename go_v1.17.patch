@@ -1,0 +1,530 @@
+From 98eb70a77ea32494a2e50203c1e329bd1fb6a99a Mon Sep 17 00:00:00 2001
+From: Vyacheslav Pachkov <slava.pach@gmail.com>
+Date: Wed, 12 Jan 2022 06:27:41 -0500
+Subject: [PATCH] cmd/{compile, link}: support mapping symbols for ARM64
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ELF for the Arm® 64-bit Architecture (AArch64):
+Mapping symbols chapter
+[https://github.com/ARM-software/abi-aa/blob/2020q4/aaelf64/aaelf64.rst#mapping-symbols]
+requires that the special symbols are inserted into object files:
+$x - At the start of a region of code containing AArch64 instructions.
+$d - At the start of a region of data.
+
+This patch introduces special mapping symbols that identify inline
+transitions between code and literal pool boundaries.
+---
+ src/cmd/internal/goobj/funcinfo.go     |  46 ++++++++-
+ src/cmd/internal/obj/arm64/asm7.go     |  33 ++++++-
+ src/cmd/internal/obj/link.go           |   2 +
+ src/cmd/internal/obj/objfile.go        |  18 +++-
+ src/cmd/link/elf_test.go               |  93 ++++++++++++++++++
+ src/cmd/link/internal/ld/symtab.go     | 130 ++++++++++++++++++++-----
+ src/cmd/link/internal/loader/loader.go |  14 +++
+ 7 files changed, 305 insertions(+), 31 deletions(-)
+
+diff --git a/src/cmd/internal/goobj/funcinfo.go b/src/cmd/internal/goobj/funcinfo.go
+index 6d33a10a51..b37c5b39a9 100644
+--- a/src/cmd/internal/goobj/funcinfo.go
++++ b/src/cmd/internal/goobj/funcinfo.go
+@@ -32,7 +32,8 @@ type FuncInfo struct {
+ 	Funcdataoff []uint32
+ 	File        []CUFileIndex
+ 
+-	InlTree []InlTreeNode
++	InlTree   []InlTreeNode
++	PoolsInfo []PoolInfo
+ }
+ 
+ func (a *FuncInfo) Write(w *bytes.Buffer) {
+@@ -76,6 +77,10 @@ func (a *FuncInfo) Write(w *bytes.Buffer) {
+ 	for i := range a.InlTree {
+ 		a.InlTree[i].Write(w)
+ 	}
++	writeUint32(uint32(len(a.PoolsInfo)))
++	for _, x := range a.PoolsInfo {
++		x.Write(w)
++	}
+ }
+ 
+ // FuncInfoLengths is a cache containing a roadmap of offsets and
+@@ -92,6 +97,8 @@ type FuncInfoLengths struct {
+ 	FileOff        uint32
+ 	NumInlTree     uint32
+ 	InlTreeOff     uint32
++	NumPoolInfo    uint32
++	PoolInfoOff    uint32
+ 	Initialized    bool
+ }
+ 
+@@ -116,11 +123,48 @@ func (*FuncInfo) ReadFuncInfoLengths(b []byte) FuncInfoLengths {
+ 	result.NumInlTree = binary.LittleEndian.Uint32(b[numinltreeOff:])
+ 	result.InlTreeOff = numinltreeOff + 4
+ 
++	numpoolinfoOff := result.InlTreeOff + 24*result.NumInlTree
++	result.NumPoolInfo = binary.LittleEndian.Uint32(b[numpoolinfoOff:])
++	result.PoolInfoOff = numpoolinfoOff + 4
++
+ 	result.Initialized = true
+ 
+ 	return result
+ }
+ 
++func (*FuncInfo) ReadPoolInfo(b []byte, PoolInfoOff uint32, k uint32) PoolInfo {
++	const PoolInfoSize = 4 * 2
++	var result PoolInfo
++	result.Read(b[PoolInfoOff+k*PoolInfoSize:])
++	return result
++}
++
++type PoolInfo struct {
++	PoolOff uint32
++	CodeOff uint32
++}
++
++func (pinfo *PoolInfo) Write(w *bytes.Buffer) {
++	var b [4]byte
++	writeUint32 := func(x uint32) {
++		binary.LittleEndian.PutUint32(b[:], x)
++		w.Write(b[:])
++	}
++	writeUint32(pinfo.PoolOff)
++	writeUint32(pinfo.CodeOff)
++}
++
++func (pinfo *PoolInfo) Read(b []byte) []byte {
++	readUint32 := func() uint32 {
++		x := binary.LittleEndian.Uint32(b)
++		b = b[4:]
++		return x
++	}
++	pinfo.PoolOff = readUint32()
++	pinfo.CodeOff = readUint32()
++	return b
++}
++
+ func (*FuncInfo) ReadArgs(b []byte) uint32 { return binary.LittleEndian.Uint32(b) }
+ 
+ func (*FuncInfo) ReadLocals(b []byte) uint32 { return binary.LittleEndian.Uint32(b[4:]) }
+diff --git a/src/cmd/internal/obj/arm64/asm7.go b/src/cmd/internal/obj/arm64/asm7.go
+index d99afa3d27..4c906cb8eb 100644
+--- a/src/cmd/internal/obj/arm64/asm7.go
++++ b/src/cmd/internal/obj/arm64/asm7.go
+@@ -934,6 +934,9 @@ var prfopfield = []struct {
+ // Used for padinng NOOP instruction
+ const OP_NOOP = 0xd503201f
+ 
++// Used for padding BRK instruction with 0 argument
++const OP_BRK0 = 0xd4200000
++
+ // align code to a certain length by padding bytes.
+ func pcAlignPadLength(pc int64, alignedValue int64, ctxt *obj.Link) int {
+ 	if !((alignedValue&(alignedValue-1) == 0) && 8 <= alignedValue && alignedValue <= 2048) {
+@@ -1077,7 +1080,12 @@ func span7(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
+ 	/*
+ 	 * lay out the code, emitting code and data relocations.
+ 	 */
+-	c.cursym.Grow(c.cursym.Size)
++	// To reduce the amount of inline transitions between code and data for ARM64,
++	// we align functions with BRK instructions instead of regular zeroing.
++	// The less amount of inline transitions, the less mapping symbols are placed in a binary
++	// and the smaller a symbol table will be.
++	// See ld/symtab.go - genElfMappingSymbols
++	c.alignWithBrk(c.cursym, c.cursym.Size)
+ 	bp := c.cursym.P
+ 	psz := int32(0)
+ 	var i int
+@@ -1126,6 +1134,15 @@ func span7(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
+ 	obj.MarkUnsafePoints(c.ctxt, c.cursym.Func().Text, c.newprog, c.isUnsafePoint, c.isRestartable)
+ }
+ 
++// alignWithBrk aligns function content up to lsiz by using BRK instructions
++func (c *ctxt7) alignWithBrk(sym *obj.LSym, lsiz int64) {
++	pos := len(sym.P)
++	sym.Grow(lsiz)
++	for ; pos < int(sym.Size); pos += 4 {
++		c.ctxt.Arch.ByteOrder.PutUint32(sym.P[pos:], OP_BRK0)
++	}
++}
++
+ // isUnsafePoint returns whether p is an unsafe point.
+ func (c *ctxt7) isUnsafePoint(p *obj.Prog) bool {
+ 	// If p explicitly uses REGTMP, it's unsafe to preempt, because the
+@@ -1169,13 +1186,25 @@ func (c *ctxt7) flushpool(p *obj.Prog, skip int) {
+ 			if c.ctxt.Debugvlog && skip == 1 {
+ 				fmt.Printf("note: flush literal pool at %#x: len=%d ref=%x\n", uint64(p.Pc+4), c.pool.size, c.pool.start)
+ 			}
+-			q := c.newprog()
++			// Since the position of a pool could be changed on the further passes we can't know
++			// it for sure at this point. So we allocate a jmp instruction that's placed before the
++			// pool in non-reusable memory and then find the pool location as q.Pc in genFuncInfoSyms.
++			q := new(obj.Prog)
++
++			// Do the same for a target Prog since the beginning of the next instructions area could be changed.
++			if p.Link != nil {
++				plinknew := new(obj.Prog)
++				*plinknew = *p.Link
++				p.Link = plinknew
++			}
++
+ 			q.As = AB
+ 			q.To.Type = obj.TYPE_BRANCH
+ 			q.To.SetTarget(p.Link)
+ 			q.Link = c.blitrl
+ 			q.Pos = p.Pos
+ 			c.blitrl = q
++			c.cursym.Func().Pool = append(c.cursym.Func().Pool, q)
+ 		} else if p.Pc+int64(c.pool.size)-int64(c.pool.start) < maxPCDisp {
+ 			return
+ 		}
+diff --git a/src/cmd/internal/obj/link.go b/src/cmd/internal/obj/link.go
+index 28626e6e03..8637e0ede4 100644
+--- a/src/cmd/internal/obj/link.go
++++ b/src/cmd/internal/obj/link.go
+@@ -488,6 +488,8 @@ type FuncInfo struct {
+ 	ArgInfo            *LSym // argument info for traceback
+ 
+ 	FuncInfoSym *LSym
++
++	Pool []*Prog
+ }
+ 
+ // NewFuncInfo allocates and returns a FuncInfo for LSym.
+diff --git a/src/cmd/internal/obj/objfile.go b/src/cmd/internal/obj/objfile.go
+index 24fb5a19de..56171afa7e 100644
+--- a/src/cmd/internal/obj/objfile.go
++++ b/src/cmd/internal/obj/objfile.go
+@@ -669,11 +669,21 @@ func genFuncInfoSyms(ctxt *Link) {
+ 		if fn == nil {
+ 			continue
+ 		}
++		poolsInfo := make([]goobj.PoolInfo, len(fn.Pool))
++
++		for i, p := range fn.Pool {
++			poolsInfo[i].PoolOff = uint32(p.Pc)
++			target := p.To.Target()
++			if target != nil {
++				poolsInfo[i].CodeOff = uint32(target.Pc)
++			}
++		}
+ 		o := goobj.FuncInfo{
+-			Args:     uint32(fn.Args),
+-			Locals:   uint32(fn.Locals),
+-			FuncID:   fn.FuncID,
+-			FuncFlag: fn.FuncFlag,
++			Args:      uint32(fn.Args),
++			Locals:    uint32(fn.Locals),
++			FuncID:    fn.FuncID,
++			FuncFlag:  fn.FuncFlag,
++			PoolsInfo: poolsInfo,
+ 		}
+ 		pc := &fn.Pcln
+ 		o.Pcsp = makeSymRef(preparePcSym(pc.Pcsp))
+diff --git a/src/cmd/link/elf_test.go b/src/cmd/link/elf_test.go
+index 012c0b5169..52d861efb6 100644
+--- a/src/cmd/link/elf_test.go
++++ b/src/cmd/link/elf_test.go
+@@ -17,6 +17,7 @@ import (
+ 	"os/exec"
+ 	"path/filepath"
+ 	"runtime"
++	"sort"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+@@ -411,3 +412,95 @@ func TestPIESize(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestMappingSymbols(t *testing.T) {
++	if runtime.GOARCH != "arm64" {
++		t.Skip("skipping arm64 only test")
++	}
++
++	testenv.MustHaveGoBuild(t)
++	t.Parallel()
++
++	buildmodes := []string{"exe", "pie"}
++
++	var wg sync.WaitGroup
++	wg.Add(len(buildmodes))
++
++	for _, buildmode := range buildmodes {
++		go func(mode string) {
++			defer wg.Done()
++			symbols := buildSymbols(t, mode)
++			checkMappingSymbols(t, symbols)
++		}(buildmode)
++	}
++
++	wg.Wait()
++}
++
++// Builds a simple program, then returns a corresponding symbol table for that binary
++func buildSymbols(t *testing.T, mode string) []elf.Symbol {
++	goTool := testenv.GoToolPath(t)
++
++	dir := t.TempDir()
++
++	goFile := filepath.Join(dir, "main.go")
++	if err := ioutil.WriteFile(goFile, []byte(goSource), 0444); err != nil {
++		t.Fatal(err)
++	}
++	if err := ioutil.WriteFile(filepath.Join(dir, "go.mod"), []byte("module elf_test\n"), 0666); err != nil {
++		t.Fatal(err)
++	}
++
++	cmd := exec.Command(goTool, "build", "-o", mode, "-buildmode="+mode)
++	cmd.Dir = dir
++
++	t.Logf("%s build", goTool)
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Logf("%s", out)
++		t.Fatal(err)
++	}
++
++	bin := filepath.Join(dir, mode)
++
++	elfexe, err := elf.Open(bin)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	symbols, err := elfexe.Symbols()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	return symbols
++}
++
++// Checks that mapping symbols are inserted correctly inside a symbol table.
++func checkMappingSymbols(t *testing.T, symbols []elf.Symbol) {
++	// mappingSymbols variable keeps only "$x" and "$d" symbols sorted by their position.
++	var mappingSymbols []elf.Symbol
++	for _, symbol := range symbols {
++		if symbol.Name == "$x" || symbol.Name == "$d" {
++			if elf.ST_TYPE(symbol.Info) != elf.STT_NOTYPE || elf.ST_BIND(symbol.Info) != elf.STB_LOCAL {
++				t.Fatalf("met \"%v\" symbol at %v position with incorrect info %v", symbol.Name, symbol.Value, symbol.Info)
++			}
++			mappingSymbols = append(mappingSymbols, symbol)
++		}
++	}
++	sort.Slice(mappingSymbols, func(i, j int) bool {
++		return mappingSymbols[i].Value < mappingSymbols[j].Value
++	})
++
++	if len(mappingSymbols) == 0 {
++		t.Fatal("binary does not have mapping symbols")
++	}
++
++	for i := 0; i < len(mappingSymbols)-1; i += 2 {
++		if mappingSymbols[i].Name == "$d" {
++			t.Fatalf("met unexpected \"$d\" symbol at %v position", mappingSymbols[i].Value)
++		}
++		if i+1 < len(mappingSymbols) && mappingSymbols[i+1].Name == "$x" {
++			t.Fatalf("met unexpected \"$x\" symbol at %v position", mappingSymbols[i+1].Value)
++		}
++	}
++}
+diff --git a/src/cmd/link/internal/ld/symtab.go b/src/cmd/link/internal/ld/symtab.go
+index 00f557875a..1ad351bbb2 100644
+--- a/src/cmd/link/internal/ld/symtab.go
++++ b/src/cmd/link/internal/ld/symtab.go
+@@ -33,6 +33,7 @@ package ld
+ import (
+ 	"cmd/internal/obj"
+ 	"cmd/internal/objabi"
++	"cmd/internal/sys"
+ 	"cmd/link/internal/loader"
+ 	"cmd/link/internal/sym"
+ 	"debug/elf"
+@@ -78,30 +79,10 @@ func putelfsyment(out *OutBuf, off int, addr int64, size int64, info uint8, shnd
+ 
+ func putelfsym(ctxt *Link, x loader.Sym, typ elf.SymType, curbind elf.SymBind) {
+ 	ldr := ctxt.loader
+-	addr := ldr.SymValue(x)
+-	size := ldr.SymSize(x)
+ 
+-	xo := x
+-	if ldr.OuterSym(x) != 0 {
+-		xo = ldr.OuterSym(x)
+-	}
+-	xot := ldr.SymType(xo)
+-	xosect := ldr.SymSect(xo)
+-
+-	var elfshnum elf.SectionIndex
+-	if xot == sym.SDYNIMPORT || xot == sym.SHOSTOBJ || xot == sym.SUNDEFEXT {
+-		elfshnum = elf.SHN_UNDEF
+-		size = 0
+-	} else {
+-		if xosect == nil {
+-			ldr.Errorf(x, "missing section in putelfsym")
+-			return
+-		}
+-		if xosect.Elfsect == nil {
+-			ldr.Errorf(x, "missing ELF section in putelfsym")
+-			return
+-		}
+-		elfshnum = xosect.Elfsect.(*ElfShdr).shnum
++	addr, size, sect, elfshnum, ok := getSymInfo(ctxt, x)
++	if !ok {
++		return
+ 	}
+ 
+ 	sname := ldr.SymExtname(x)
+@@ -126,7 +107,7 @@ func putelfsym(ctxt *Link, x loader.Sym, typ elf.SymType, curbind elf.SymBind) {
+ 	}
+ 
+ 	if ctxt.LinkMode == LinkExternal && elfshnum != elf.SHN_UNDEF {
+-		addr -= int64(xosect.Vaddr)
++		addr -= int64(sect.Vaddr)
+ 	}
+ 	other := int(elf.STV_DEFAULT)
+ 	if ldr.AttrVisibilityHidden(x) {
+@@ -177,6 +158,105 @@ func putelfsym(ctxt *Link, x loader.Sym, typ elf.SymType, curbind elf.SymBind) {
+ 	ctxt.numelfsym++
+ }
+ 
++// Generates special mapping symbols that are required by ARM64 ELF standtard.
++// https://github.com/ARM-software/abi-aa/blob/2020q4/aaelf64/aaelf64.rst#mapping-symbols
++func genElfMappingSymbols(ctxt *Link) {
++	if ctxt.Arch.Family != sys.ARM64 || !ctxt.IsELF {
++		return
++	}
++
++	ldr := ctxt.loader
++
++	// There are 2 symbols designed to mark inline transitions between code adn data:
++	// $d in the beginning of a sequence of data.
++	// $x in the beginning of a sequence of ARM64 instructions.
++	// Mapping symbols have type STT_NOTYPE and binding STB_LOCAL, the st_size field is unused and must be zero.
++	datasymb := putelfstr("$d")
++	codesymb := putelfstr("$x")
++
++	needcodesymb := true
++	for _, s := range ctxt.Textp {
++		funcinfo := ldr.FuncInfo(s)
++		if !funcinfo.Valid() {
++			continue
++		}
++		funcinfo.Preload()
++		numpoolinfo := funcinfo.NumPoolInfo()
++
++		if !needcodesymb && numpoolinfo == 0 {
++			continue
++		}
++
++		// sz is ignored, because accroding to the documentation the st_size field must be zero.
++		addr, _, sect, elfshnum, ok := getSymInfo(ctxt, s)
++		if !ok {
++			continue
++		}
++
++		if needcodesymb {
++			if ctxt.LinkMode == LinkExternal && elfshnum != elf.SHN_UNDEF {
++				addr -= int64(sect.Vaddr)
++			}
++			putelfsyment(ctxt.Out, codesymb, addr, 0, elf.ST_INFO(elf.STB_LOCAL, elf.STT_NOTYPE), elfshnum, 0)
++			ctxt.numelfsym++
++			needcodesymb = false
++		}
++
++		for at := uint32(0); at < numpoolinfo; at++ {
++			poolInfo := funcinfo.PoolInfo(at)
++			poollocation := ldr.SymValue(s) + int64(poolInfo.PoolOff)
++			codelocation := ldr.SymValue(s) + int64(poolInfo.CodeOff)
++
++			if ctxt.LinkMode == LinkExternal && elfshnum != elf.SHN_UNDEF {
++				poollocation -= int64(sect.Vaddr)
++				codelocation -= int64(sect.Vaddr)
++			}
++
++			putelfsyment(ctxt.Out, datasymb, poollocation+4, 0, elf.ST_INFO(elf.STB_LOCAL, elf.STT_NOTYPE), elfshnum, 0)
++			ctxt.numelfsym++
++			needcodesymb = true
++
++			if poolInfo.CodeOff != 0 {
++				putelfsyment(ctxt.Out, codesymb, codelocation, 0, elf.ST_INFO(elf.STB_LOCAL, elf.STT_NOTYPE), elfshnum, 0)
++				ctxt.numelfsym++
++				needcodesymb = false
++			}
++		}
++	}
++}
++
++// getSymInfo returns generic information about symbol size and position that's needed inside putelfsym and genElfMappingSymbols.
++func getSymInfo(ctxt *Link, x loader.Sym) (addr int64, sz int64, sect *sym.Section, elfshnum elf.SectionIndex, ok bool) {
++	ldr := ctxt.loader
++	addr = ldr.SymValue(x)
++	sz = ldr.SymSize(x)
++
++	xo := x
++	if ldr.OuterSym(x) != 0 {
++		xo = ldr.OuterSym(x)
++	}
++	xot := ldr.SymType(xo)
++	sect = ldr.SymSect(xo)
++
++	if xot == sym.SDYNIMPORT || xot == sym.SHOSTOBJ || xot == sym.SUNDEFEXT {
++		elfshnum = elf.SHN_UNDEF
++		sz = 0
++	} else {
++		if sect == nil {
++			ldr.Errorf(x, "missing section in putelfsym")
++			return
++		}
++		if sect.Elfsect == nil {
++			ldr.Errorf(x, "missing ELF section in putelfsym")
++			return
++		}
++		elfshnum = sect.Elfsect.(*ElfShdr).shnum
++	}
++
++	ok = true
++	return
++}
++
+ func putelfsectionsym(ctxt *Link, out *OutBuf, s loader.Sym, shndx elf.SectionIndex) {
+ 	putelfsyment(out, 0, 0, 0, elf.ST_INFO(elf.STB_LOCAL, elf.STT_SECTION), shndx, 0)
+ 	ctxt.loader.SetSymElfSym(s, int32(ctxt.numelfsym))
+@@ -275,6 +355,8 @@ func asmElfSym(ctxt *Link) {
+ 	putelfsyment(ctxt.Out, putelfstr("go.go"), 0, 0, elf.ST_INFO(elf.STB_LOCAL, elf.STT_FILE), elf.SHN_ABS, 0)
+ 	ctxt.numelfsym++
+ 
++	genElfMappingSymbols(ctxt)
++
+ 	bindings := []elf.SymBind{elf.STB_LOCAL, elf.STB_GLOBAL}
+ 	for _, elfbind := range bindings {
+ 		if elfbind == elf.STB_GLOBAL {
+diff --git a/src/cmd/link/internal/loader/loader.go b/src/cmd/link/internal/loader/loader.go
+index 9d5319c312..47aac15eda 100644
+--- a/src/cmd/link/internal/loader/loader.go
++++ b/src/cmd/link/internal/loader/loader.go
+@@ -2045,6 +2045,20 @@ func (fi *FuncInfo) InlTree(k int) InlTreeNode {
+ 	}
+ }
+ 
++func (fi *FuncInfo) NumPoolInfo() uint32 {
++	if !fi.lengths.Initialized {
++		panic("need to call Preload first")
++	}
++	return fi.lengths.NumPoolInfo
++}
++
++func (fi *FuncInfo) PoolInfo(k uint32) goobj.PoolInfo {
++	if !fi.lengths.Initialized {
++		panic("need to call Preload first")
++	}
++	return (*goobj.FuncInfo)(nil).ReadPoolInfo(fi.data, fi.lengths.PoolInfoOff, k)
++}
++
+ func (l *Loader) FuncInfo(i Sym) FuncInfo {
+ 	var r *oReader
+ 	var auxs []goobj.Aux
+-- 
+2.33.1
+
